@@ -6,7 +6,7 @@ Aufbau:
     features.py  - Feature Engineering für Kanten und Knoten (erweiterbar über Registry)
     graph.py     - PyG Data-Objekt bauen, Split erzeugen, Kantenfeatures an Splits hängen
     io.py        - fertigen Split speichern/laden
-    training.py  - Trainingsloop + Auswertung, identisch für alle Modelle
+    training.py  - Trainingsloop + Auswertung + Learning-Curve-Plots, identisch für alle Modelle
 """
 
 from .download import ensure_dataset, DEFAULT_EXTRACT_DIR
@@ -19,9 +19,9 @@ from .features import (
     build_node_features,
     build_edge_features,
 )
-from .graph import build_graph, split_graph, GraphBundle
+from .graph import build_graph, split_graph, reverse_edge_leakage, GraphBundle
 from .io import save_bundle, load_bundle
-from .training import train_link_predictor, evaluate_link_predictor, plot_auc_history
+from .training import train_link_predictor, evaluate_link_predictor, plot_auc_history, plot_learning_curves
 
 __all__ = [
     "ensure_dataset",
@@ -37,9 +37,11 @@ __all__ = [
     "build_graph",
     "split_graph",
     "GraphBundle",
+    "reverse_edge_leakage",
     "save_bundle",
     "load_bundle",
     "train_link_predictor",
     "evaluate_link_predictor",
     "plot_auc_history",
+    "plot_learning_curves",
 ]
