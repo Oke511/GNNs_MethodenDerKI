@@ -7,6 +7,20 @@ Split-Strategie (siehe `split_graph`):
     B->A beim Message Passing und soll A->B "vorhersagen" - ein Leak, der die AUC künstlich nach
     oben treibt. Standard ist deshalb der paarweise Split (`pair_aware=True`): Beide Richtungen
     eines Knotenpaars landen immer im selben Split. `reverse_edge_leakage` misst den Leak.
+
+Ein gemeinsamer Message-Passing-Graph (paarweiser Split):
+    Die Train-Paare werden nochmals geteilt: (1 - supervision_ratio) bilden den Message-Passing-Graphen,
+    supervision_ratio dienen nur als Trainingslabels (wie `disjoint_train_ratio` bei `RandomLinkSplit`).
+    Train, Val und Test rechnen auf *demselben* Graphen. So fehlt jede zu bewertende Kante im Graphen
+    (keine "ist dst schon mein Nachbar?"-Abkürzung), und alle drei Splits sehen dieselbe Graphdichte.
+    Unterschiedlich dichte Graphen hatten vorher Train < Val < Test erzeugt und die BatchNorm-Statistiken
+    zwischen Training und Auswertung verschoben.
+
+Negative ("hole", Standard):
+    Jede entfernte Kante hinterlässt an ihren Endpunkten ein "Loch" (geringerer Grad). Werden Negative
+    beliebig gezogen, reicht "niedriger Grad = Link" als Heuristik für AUC ~0.8. Bei "hole" stammen beide
+    Endpunkte eines Negativs aus den Endpunkten der Positiven desselben Splits und liegen räumlich nah
+    beieinander - Positive und Negative haben gleich viele Löcher, Grad und Luftlinie trennen sie kaum.
 """
 
 import math
@@ -14,6 +28,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 import torch
+from scipy.spatial import cKDTree
 from torch_geometric import seed_everything
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomLinkSplit
@@ -21,13 +36,17 @@ from torch_geometric.transforms import RandomLinkSplit
 from .features import FeatureConfig, build_edge_features, build_node_features, engineer_edge_features
 from .parsing import NetworkFrames
 
+# Wird in load_bundle geprüft: ältere Splits (andere Graph-/Negativ-Logik, falsch geparste Zonen)
+# müssen mit data_prep.ipynb neu erzeugt werden.
+BUNDLE_VERSION = 3
+
 
 @dataclass
 class GraphBundle:
     """Alles, was die Modell-Notebooks brauchen – und nichts aus den Rohdaten."""
 
-    data: Data            # vollständiger Graph (für Embedding-Visualisierung)
-    train: Data           # edge_index/edge_attr = Message-Passing-Kanten, edge_label_* = Trainingspaare
+    data: Data            # vollständiger Graph (für Embedding-Visualisierung), data.pos = Rohkoordinaten
+    train: Data           # edge_index/edge_attr = gemeinsamer Message-Passing-Graph, edge_label_* = Trainingspaare
     val: Data
     test: Data
     node_feature_columns: list[str]
@@ -38,7 +57,7 @@ class GraphBundle:
 
     def summary(self) -> str:
         lines = [
-            f"Knoten: {self.data.num_nodes}, Kanten: {self.data.edge_index.size(1)}",
+            f"Knoten: {self.data.num_nodes} ({self.node_type.count('zone')} Zonen), Kanten: {self.data.edge_index.size(1)}",
             f"Knotenfeatures ({len(self.node_feature_columns)}): {self.node_feature_columns}",
             f"Kantenfeatures ({len(self.edge_attr_columns)}): {self.edge_attr_columns}",
         ]
@@ -46,10 +65,12 @@ class GraphBundle:
             pos = int((split.edge_label == 1).sum())
             neg = int((split.edge_label == 0).sum())
             lines.append(f"{name}: msg-passing Kanten={split.edge_index.size(1)}, Label-Paare pos={pos} neg={neg}")
-        for name, split in [("val", self.val), ("test", self.test)]:
-            leaked, total = reverse_edge_leakage(self.train, split)
+        for name, split in [("train", self.train), ("val", self.val), ("test", self.test)]:
+            leaked, total = reverse_edge_leakage(split, split)
+            in_graph = edges_in_graph(split, split)
             lines.append(
-                f"{name}: positive Kanten mit Gegenrichtung im Train-Graph: {leaked}/{total} ({leaked / max(total, 1):.1%})"
+                f"{name}: positive Label-Kanten im Message-Passing-Graph: {in_graph}/{total}, "
+                f"davon Gegenrichtung im Graph: {leaked}/{total} ({leaked / max(total, 1):.1%})"
             )
         if self.meta:
             lines.append(f"meta: {self.meta}")
@@ -61,6 +82,7 @@ def build_graph(frames: NetworkFrames, config: FeatureConfig) -> tuple[Data, pd.
 
     Gibt (data, edges_df, nodes_df_sorted, node_feature_columns, edge_attr_columns) zurück.
     edges_df enthält die engineerten Spalten, nodes_df_sorted ist nach PyG-Index sortiert.
+    data.pos enthält die unskalierten Koordinaten (für Distanz-Baselines und räumliche Negative).
     """
     nodes_df = frames.nodes.copy()
     edges_df = engineer_edge_features(frames.edges, nodes_df, config)
@@ -85,8 +107,9 @@ def build_graph(frames: NetworkFrames, config: FeatureConfig) -> tuple[Data, pd.
 
     node_matrix, node_feature_columns = build_node_features(nodes_df_sorted, edges_df, config)
     x = torch.tensor(node_matrix, dtype=torch.float)
+    pos = torch.tensor(nodes_df_sorted[["x", "y"]].values, dtype=torch.float)
 
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(all_nodes))
+    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, pos=pos, num_nodes=len(all_nodes))
     return data, edges_df, nodes_df_sorted, node_feature_columns, edge_attr_columns
 
 
@@ -106,15 +129,23 @@ def _pair_keys(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
     return lo * num_nodes + hi
 
 
-def reverse_edge_leakage(train: Data, split: Data) -> tuple[int, int]:
-    """Zählt positive Label-Kanten (u->v) in `split`, deren Gegenrichtung (v->u) im
-    Train-Message-Passing-Graphen liegt. Gibt (geleakt, gesamt) zurück; beim paarweisen Split ist geleakt == 0."""
-    num_nodes = train.num_nodes
+def reverse_edge_leakage(msg_graph: Data, split: Data) -> tuple[int, int]:
+    """Zählt positive Label-Kanten (u->v) in `split`, deren Gegenrichtung (v->u) im Message-Passing-Graphen
+    `msg_graph` liegt. Für Val/Test ist das der eigene Graph des Splits (`reverse_edge_leakage(split, split)`).
+    Gibt (geleakt, gesamt) zurück; beim paarweisen Split ist geleakt == 0."""
+    num_nodes = msg_graph.num_nodes
     pos = split.edge_label_index[:, split.edge_label == 1]
     reverse_keys = _edge_keys(pos.flip(0), num_nodes)
-    train_keys = _edge_keys(train.edge_index, num_nodes)
-    leaked = int(torch.isin(reverse_keys, train_keys).sum())
+    msg_keys = _edge_keys(msg_graph.edge_index, num_nodes)
+    leaked = int(torch.isin(reverse_keys, msg_keys).sum())
     return leaked, int(pos.size(1))
+
+
+def edges_in_graph(msg_graph: Data, split: Data) -> int:
+    """Anzahl positiver Label-Kanten von `split`, die selbst im Message-Passing-Graphen liegen (soll 0 sein)."""
+    num_nodes = msg_graph.num_nodes
+    pos = split.edge_label_index[:, split.edge_label == 1]
+    return int(torch.isin(_edge_keys(pos, num_nodes), _edge_keys(msg_graph.edge_index, num_nodes)).sum())
 
 
 def _lookup_edge_attr(
@@ -142,35 +173,74 @@ def _lookup_edge_attr(
 
 
 # ---------------------------------------------------------------------------
-# Split-Varianten
+# Negative Sampling
 # ---------------------------------------------------------------------------
 
+NEG_STRATEGIES = ("uniform", "spatial", "hole")
+
+
+def _knn_candidates(pos: torch.Tensor, k: int) -> torch.Tensor:
+    """Die k räumlich nächsten Knoten jedes Knotens (ohne sich selbst), Form [N, k]."""
+    _, idx = cKDTree(pos.numpy()).query(pos.numpy(), k=k + 1)
+    return torch.as_tensor(idx[:, 1:], dtype=torch.long)
+
+
 def _sample_negative_pairs(
-    existing_pair_keys: torch.Tensor, num_nodes: int, num_pairs: int, generator: torch.Generator
+    excluded_pair_keys: torch.Tensor,
+    num_nodes: int,
+    num_pairs: int,
+    generator: torch.Generator,
+    anchors: torch.Tensor | None = None,
+    candidates: torch.Tensor | None = None,
+    allowed: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Zieht `num_pairs` verschiedene ungeordnete Knotenpaare {u, v}, u != v, die im Graphen in
-    keiner Richtung existieren. Rejection Sampling: bei 13k Knoten und ~20k Paaren liegt die
-    Trefferquote nahe 100 %, daher reichen ein bis zwei Runden."""
+    """Zieht `num_pairs` verschiedene ungeordnete Knotenpaare {u, v}, u != v, die nicht in
+    `excluded_pair_keys` liegen (existierende Kanten, bereits vergebene Negative). Rejection Sampling.
+
+    candidates is None ("uniform"): u, v gleichverteilt über alle Knoten.
+    sonst: u = Endpunkt einer zufälligen Kante aus `anchors` [2, E], v = zufälliger Eintrag aus candidates[u];
+    mit `allowed` (bool-Maske über die Knoten) werden nur v aus der Maske akzeptiert. Der Suchradius
+    (k nächste Knoten insgesamt) ist damit für alle Splits gleich, unabhängig davon, wie viele Knoten erlaubt sind.
+    """
     collected = []
     unique_keys = torch.empty(0, dtype=torch.long)
-    while unique_keys.numel() < num_pairs:
+    for _ in range(1000):
+        if unique_keys.numel() >= num_pairs:
+            break
         n_draw = int((num_pairs - unique_keys.numel()) * 1.2) + 16
-        u = torch.randint(0, num_nodes, (n_draw,), generator=generator)
-        v = torch.randint(0, num_nodes, (n_draw,), generator=generator)
+        if candidates is None:
+            u = torch.randint(0, num_nodes, (n_draw,), generator=generator)
+            v = torch.randint(0, num_nodes, (n_draw,), generator=generator)
+        else:
+            pick = torch.randint(0, anchors.size(1), (n_draw,), generator=generator)
+            side = torch.randint(0, 2, (n_draw,), generator=generator)
+            u = anchors[side, pick]
+            v = candidates[u, torch.randint(0, candidates.size(1), (n_draw,), generator=generator)]
         keep = u != v
+        if allowed is not None:
+            keep &= allowed[v]
         keys = torch.minimum(u, v)[keep] * num_nodes + torch.maximum(u, v)[keep]
-        collected.append(keys[~torch.isin(keys, existing_pair_keys)])
+        collected.append(keys[~torch.isin(keys, excluded_pair_keys)])
         unique_keys = torch.unique(torch.cat(collected))
-    # torch.unique sortiert - wieder mischen, damit die Zuordnung zu den Splits zufällig bleibt
+    else:
+        raise RuntimeError("Nicht genug Negative gefunden - spatial_k erhöhen oder neg_sampling_ratio senken.")
+    # torch.unique sortiert - wieder mischen
     unique_keys = unique_keys[torch.randperm(unique_keys.numel(), generator=generator)[:num_pairs]]
     return torch.stack([unique_keys // num_nodes, unique_keys % num_nodes])
 
 
+# ---------------------------------------------------------------------------
+# Split-Varianten
+# ---------------------------------------------------------------------------
+
 def _split_graph_pairwise(
-    data: Data, seed: int, val_ratio: float, test_ratio: float, neg_sampling_ratio: float
+    data: Data, seed: int, val_ratio: float, test_ratio: float, neg_sampling_ratio: float,
+    neg_strategy: str, spatial_k: int, supervision_ratio: float,
 ) -> tuple[Data, Data, Data]:
-    """Paarweiser Split: Train/Val/Test werden über ungeordnete Knotenpaare {u, v} gezogen,
-    beide Richtungen einer Straße erben denselben Split. Verhindert den reziproken Leak."""
+    """Paarweiser Split über ungeordnete Knotenpaare {u, v}; beide Richtungen einer Straße erben denselben
+    Split (verhindert den reziproken Leak). Alle Splits teilen sich einen Message-Passing-Graphen."""
+    if not 0.0 < supervision_ratio < 1.0:
+        raise ValueError("supervision_ratio muss in (0, 1) liegen.")
     generator = torch.Generator().manual_seed(seed)
     num_nodes = data.num_nodes
 
@@ -178,33 +248,47 @@ def _split_graph_pairwise(
     unique_pairs, pair_of_edge = torch.unique(pair_keys, return_inverse=True)
     num_pairs = unique_pairs.numel()
 
-    # 0 = train, 1 = val, 2 = test - pro Knotenpaar zugewiesen, an beide Richtungen vererbt
+    # Pro Knotenpaar: 0 = Message Passing, 1 = Val, 2 = Test, 3 = Train-Supervision (nur Label)
     perm = torch.randperm(num_pairs, generator=generator)
     n_val = int(round(val_ratio * num_pairs))
     n_test = int(round(test_ratio * num_pairs))
+    n_sup = int(round(supervision_ratio * (num_pairs - n_val - n_test)))
     pair_split = torch.zeros(num_pairs, dtype=torch.long)
     pair_split[perm[:n_val]] = 1
     pair_split[perm[n_val:n_val + n_test]] = 2
+    pair_split[perm[n_val + n_test:n_val + n_test + n_sup]] = 3
     edge_split = pair_split[pair_of_edge]
+    msg_mask = edge_split == 0
 
     # Positive Label: die tatsächlich existierenden gerichteten Kanten (Einbahnstraßen nur einmal)
-    positives = {s: data.edge_index[:, edge_split == s] for s in (0, 1, 2)}
+    label_split = {"train": 3, "val": 1, "test": 2}
+    positives = {name: data.edge_index[:, edge_split == s] for name, s in label_split.items()}
 
-    # Negative Label: Paare, die in keiner Richtung existieren, jeweils in beide Richtungen
-    # eingetragen. So bleibt neg/pos ~= neg_sampling_ratio und Negative werden symmetrisch behandelt.
-    n_neg_pairs = {s: math.ceil(neg_sampling_ratio * positives[s].size(1) / 2) for s in (0, 1, 2)}
-    neg_pairs = _sample_negative_pairs(unique_pairs, num_nodes, sum(n_neg_pairs.values()), generator)
-    negatives, offset = {}, 0
-    for s in (0, 1, 2):
-        chunk = neg_pairs[:, offset:offset + n_neg_pairs[s]]
-        offset += n_neg_pairs[s]
-        negatives[s] = torch.cat([chunk, chunk.flip(0)], dim=1)
+    # Negative Label: Paare, die in keiner Richtung existieren, jeweils in beide Richtungen eingetragen
+    # (neg/pos ~= neg_sampling_ratio, Negative symmetrisch). Splits nacheinander, damit sie disjunkt bleiben.
+    knn = _knn_candidates(data.pos, spatial_k) if neg_strategy != "uniform" else None
+    excluded = unique_pairs
+    negatives = {}
+    for name in ("train", "val", "test"):
+        n_neg_pairs = math.ceil(neg_sampling_ratio * positives[name].size(1) / 2)
+        anchors, allowed = None, None
+        if neg_strategy == "spatial":
+            anchors = data.edge_index
+        elif neg_strategy == "hole":
+            # u und v sind Endpunkte von Positiven dieses Splits, haben also ebenfalls ein "Loch"
+            anchors = positives[name]
+            allowed = torch.zeros(num_nodes, dtype=torch.bool)
+            allowed[anchors.flatten()] = True
+        chunk = _sample_negative_pairs(excluded, num_nodes, n_neg_pairs, generator, anchors, knn, allowed)
+        excluded = torch.cat([excluded, chunk[0] * num_nodes + chunk[1]])
+        negatives[name] = torch.cat([chunk, chunk.flip(0)], dim=1)
 
-    def make_split(msg_mask: torch.Tensor, s: int) -> Data:
-        label_index = torch.cat([positives[s], negatives[s]], dim=1)
-        label = torch.cat([torch.ones(positives[s].size(1)), torch.zeros(negatives[s].size(1))])
+    def make_split(name: str) -> Data:
+        label_index = torch.cat([positives[name], negatives[name]], dim=1)
+        label = torch.cat([torch.ones(positives[name].size(1)), torch.zeros(negatives[name].size(1))])
         return Data(
             x=data.x,
+            pos=data.pos,
             edge_index=data.edge_index[:, msg_mask],
             edge_attr=data.edge_attr[msg_mask],
             num_nodes=num_nodes,
@@ -212,11 +296,7 @@ def _split_graph_pairwise(
             edge_label=label,
         )
 
-    # Message-Passing-Graphen wie bei RandomLinkSplit: train/val sehen die Train-Kanten, test zusätzlich die Val-Kanten
-    train = make_split(edge_split == 0, 0)
-    val = make_split(edge_split == 0, 1)
-    test = make_split(edge_split != 2, 2)
-    return train, val, test
+    return make_split("train"), make_split("val"), make_split("test")
 
 
 def _split_graph_directed(
@@ -235,11 +315,13 @@ def _split_graph_directed(
     )
     train, val, test = transform(data)
 
+    # Kantenfeatures passend zum jeweiligen Message-Passing-Graphen nachschlagen
     generator = torch.Generator().manual_seed(seed)
-    train_attr, found = _lookup_edge_attr(data, train.edge_index, generator)
-    if not bool(found.all()):
-        raise RuntimeError("Train-Message-Passing-Kanten nicht im Originalgraph gefunden.")
-    train.edge_attr = train_attr
+    for split in (train, val, test):
+        attr, found = _lookup_edge_attr(data, split.edge_index, generator)
+        if not bool(found.all()):
+            raise RuntimeError("Message-Passing-Kanten nicht im Originalgraph gefunden.")
+        split.edge_attr = attr
     return train, val, test
 
 
@@ -250,28 +332,36 @@ def split_graph(
     test_ratio: float = 0.1,
     neg_sampling_ratio: float = 2.0,
     pair_aware: bool = True,
+    neg_strategy: str = "hole",
+    spatial_k: int = 20,
+    supervision_ratio: float = 0.3,
 ) -> tuple[Data, Data, Data]:
     """Train/Val/Test-Split mit festem Seed, anschließend Kantenfeatures an die Splits hängen.
 
-    pair_aware=True (Standard): paarweiser Split, beide Richtungen eines Knotenpaars im selben Split
-                                (siehe Modul-Docstring und `_split_graph_pairwise`).
-    pair_aware=False:           alter kantenweiser RandomLinkSplit mit reziprokem Leak.
+    pair_aware=True (Standard): paarweiser Split, beide Richtungen eines Knotenpaars im selben Split,
+                                ein gemeinsamer Message-Passing-Graph für alle Splits (siehe Modul-Docstring).
+    pair_aware=False:           alter kantenweiser RandomLinkSplit mit reziprokem Leak (nur zum Vergleich).
+    supervision_ratio:          Anteil der Train-Paare, die nur als Trainingslabels dienen (nicht im Graphen).
+    neg_strategy:               "hole" (Standard, Endpunkte der Positiven desselben Splits, räumlich nah),
+                                "spatial" (unter den `spatial_k` nächsten Knoten) oder "uniform" (beliebige Paare).
 
     Rückgabe für beide Varianten gleich:
-    - train.edge_attr: Features der Message-Passing-Kanten (Teilgraph)
-    - *.edge_label_attr: Features zu edge_label_index (Negativ-Beispiele: zufällig gezogen)
-    - val/test.edge_attr werden entfernt, um Verwechslung zu vermeiden
+    - *.edge_index/edge_attr: Message-Passing-Graph (beim paarweisen Split für alle Splits derselbe)
+    - *.edge_label_index/edge_label: zu bewertende Paare
+    - *.edge_label_attr: Features zu edge_label_index (Negativ-Beispiele: zufällig gezogen, nur für Analysen)
     """
+    if neg_strategy not in NEG_STRATEGIES:
+        raise ValueError(f"neg_strategy muss eines von {NEG_STRATEGIES} sein, nicht {neg_strategy!r}.")
     if pair_aware:
-        train, val, test = _split_graph_pairwise(data, seed, val_ratio, test_ratio, neg_sampling_ratio)
+        train, val, test = _split_graph_pairwise(
+            data, seed, val_ratio, test_ratio, neg_sampling_ratio, neg_strategy, spatial_k, supervision_ratio
+        )
     else:
         train, val, test = _split_graph_directed(data, seed, val_ratio, test_ratio, neg_sampling_ratio)
 
     generator = torch.Generator().manual_seed(seed + 1)
     for split in (train, val, test):
         split.x = data.x
+        split.pos = data.pos
         split.edge_label_attr, _ = _lookup_edge_attr(data, split.edge_label_index, generator)
-    for split in (val, test):
-        if "edge_attr" in split:
-            del split.edge_attr
     return train, val, test

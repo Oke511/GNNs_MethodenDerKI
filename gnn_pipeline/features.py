@@ -50,7 +50,9 @@ class FeatureConfig:
     )
     edge_binary: list[str] = field(default_factory=lambda: ["capacity_is_placeholder", "has_reciprocal"])
     one_hot_link_type: bool = True
-    scale_edge_numerical: bool = False
+    # log1p vor dem Skalieren: Kapazität, Länge usw. sind stark rechtsschief
+    log_edge_numerical: bool = True
+    scale_edge_numerical: bool = True
     drop_edge_columns: list[str] = field(default_factory=lambda: ["B", "Power", "Speed_Limit"])
 
 
@@ -59,24 +61,34 @@ class FeatureConfig:
 # ---------------------------------------------------------------------------
 
 def engineer_edge_features(edges_df: pd.DataFrame, nodes_df: pd.DataFrame, config: FeatureConfig) -> pd.DataFrame:
-    """Platzhalter-Flag, One-Hot-Link-Type, Reziprok-Verhältnis, Koordinatendifferenzen."""
+    """Platzhalter-Flag, One-Hot-Link-Type, Reziprok-Verhältnis, Koordinatendifferenzen.
+
+    Die Platzhalter-Kapazität 999999 (Zonen-Konnektoren) wird durch 0 ersetzt, die Information trägt
+    `capacity_is_placeholder`. Sonst dominiert der Platzhalter die Skalierung, und alle echten
+    Kapazitäten landen nach dem StandardScaler praktisch auf demselben Wert.
+    """
     edges_df = edges_df.copy()
 
-    edges_df["capacity_is_placeholder"] = np.where(edges_df["Capacity"] == CAPACITY_PLACEHOLDER, 1, 0)
+    is_placeholder = edges_df["Capacity"] == CAPACITY_PLACEHOLDER
+    edges_df["capacity_is_placeholder"] = is_placeholder.astype(int)
+    real_capacity = edges_df["Capacity"].where(~is_placeholder)   # NaN für Platzhalter
+    edges_df["Capacity"] = real_capacity.fillna(0.0)
 
     if config.one_hot_link_type and "Type" in edges_df.columns:
         edges_df = pd.get_dummies(edges_df, columns=["Type"], prefix="link_type")
 
     edges_df = edges_df.drop(columns=config.drop_edge_columns, errors="ignore")
 
-    # Reziproke Kapazität: Capacity(A->B) / Capacity(B->A), 0 falls keine Gegenkante
-    reciprocal = edges_df[["from_node", "to_node", "Capacity"]].rename(
-        columns={"from_node": "to_node", "to_node": "from_node", "Capacity": "recip_Capacity"}
+    # Reziproke Kapazität: Capacity(A->B) / Capacity(B->A) auf echten Kapazitäten,
+    # 0 falls keine Gegenkante existiert oder eine der beiden Kapazitäten ein Platzhalter ist
+    edges_df["_real_capacity"] = real_capacity.values
+    reciprocal = edges_df[["from_node", "to_node", "_real_capacity"]].rename(
+        columns={"from_node": "to_node", "to_node": "from_node", "_real_capacity": "recip_capacity"}
     )
-    edges_df = pd.merge(edges_df, reciprocal, on=["from_node", "to_node"], how="left")
-    edges_df["has_reciprocal"] = edges_df["recip_Capacity"].notna().astype(int)
-    edges_df["capacity_ratio"] = (edges_df["Capacity"] / edges_df["recip_Capacity"]).fillna(0)
-    edges_df = edges_df.drop(columns=["recip_Capacity"])
+    edges_df = pd.merge(edges_df, reciprocal, on=["from_node", "to_node"], how="left", indicator=True)
+    edges_df["has_reciprocal"] = (edges_df["_merge"] == "both").astype(int)
+    edges_df["capacity_ratio"] = (edges_df["_real_capacity"] / edges_df["recip_capacity"]).fillna(0.0)
+    edges_df = edges_df.drop(columns=["_real_capacity", "recip_capacity", "_merge"])
 
     # Absolute Koordinatendifferenzen zwischen Start- und Zielknoten
     coords = nodes_df.set_index("node_id")[["x", "y"]]
@@ -98,8 +110,12 @@ def build_edge_features(edges_df: pd.DataFrame, config: FeatureConfig) -> tuple[
         raise KeyError(f"Kantenfeatures fehlen in edges_df: {missing}")
 
     matrix = edges_df[columns].astype(float).values
-    if config.scale_edge_numerical and config.edge_numerical:
-        idx = [columns.index(c) for c in config.edge_numerical]
+    idx = [columns.index(c) for c in config.edge_numerical]
+    if config.log_edge_numerical and idx:
+        if (matrix[:, idx] < 0).any():
+            raise ValueError("log_edge_numerical erwartet nicht-negative numerische Kantenfeatures.")
+        matrix[:, idx] = np.log1p(matrix[:, idx])
+    if config.scale_edge_numerical and idx:
         matrix[:, idx] = StandardScaler().fit_transform(matrix[:, idx])
     return matrix, columns
 
@@ -110,7 +126,7 @@ def build_edge_features(edges_df: pd.DataFrame, config: FeatureConfig) -> tuple[
 
 @register_node_feature("coords")
 def _coords(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) -> pd.DataFrame:
-    """Rohkoordinaten x, y (Standard aus dem GATv2-Notebook)."""
+    """Koordinaten x, y (werden mit scale_node_features=True standardisiert)."""
     return nodes_df[["x", "y"]].copy()
 
 

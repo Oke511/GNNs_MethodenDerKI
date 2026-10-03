@@ -5,14 +5,16 @@ from dataclasses import asdict
 
 import torch
 
-from .graph import GraphBundle
+from .graph import BUNDLE_VERSION, GraphBundle
 
 DEFAULT_BUNDLE_PATH = os.path.join("processed", "philadelphia_split.pt")
 
 
 def save_bundle(bundle: GraphBundle, path: str = DEFAULT_BUNDLE_PATH) -> str:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save(asdict(bundle), path)
+    payload = asdict(bundle)
+    payload["meta"] = {**bundle.meta, "bundle_version": BUNDLE_VERSION}
+    torch.save(payload, path)
     print(f"Split gespeichert: {path}")
     return path
 
@@ -22,6 +24,12 @@ def load_bundle(path: str = DEFAULT_BUNDLE_PATH, device: torch.device | str | No
     if not os.path.exists(path):
         raise FileNotFoundError(f"{path} nicht gefunden. Zuerst data_prep.ipynb ausführen.")
     payload = torch.load(path, weights_only=False)
+    version = payload.get("meta", {}).get("bundle_version", 1)
+    if version != BUNDLE_VERSION:
+        raise RuntimeError(
+            f"{path} hat Version {version}, erwartet wird {BUNDLE_VERSION}. "
+            "data_prep.ipynb neu ausführen, um den Split mit der aktuellen Pipeline zu erzeugen."
+        )
     bundle = GraphBundle(**payload)
     if device is not None:
         bundle.data = bundle.data.to(device)

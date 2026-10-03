@@ -1,0 +1,10 @@
+# Rohdaten (werden von gnn_pipeline.download geladen) und erzeugter Split
+TransportationNetworks_master/
+processed/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/

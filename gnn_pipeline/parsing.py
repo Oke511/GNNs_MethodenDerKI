@@ -1,7 +1,8 @@
-"""Parser für die .tntp-Dateien (Knoten, Kanten, Trips)."""
+"""Parser für die .tntp-Dateien (Metadaten, Knoten, Kanten)."""
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -21,6 +22,8 @@ COLUMN_NAME_MAP = {
 INT_COLUMNS = {"from_node", "to_node", "Type"}
 FLOAT_COLUMNS = {"Capacity", "Length", "free_flow_time", "B", "Power", "Speed_Limit", "Toll"}
 
+_METADATA_PATTERN = re.compile(r"^<([^>]+)>\s*(.*)$")
+
 
 @dataclass
 class NetworkFrames:
@@ -28,10 +31,27 @@ class NetworkFrames:
 
     nodes: node_id, x, y, type ('zone' | 'crossing')
     edges: from_node, to_node, Capacity, Length, free_flow_time, B, Power, Speed_Limit, Toll, Type
+    metadata: Kopfzeilen der Netzdatei, z. B. {"NUMBER OF ZONES": "1525", ...}
     """
 
     nodes: pd.DataFrame
     edges: pd.DataFrame
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+def parse_metadata(tntp_file_path: str) -> dict[str, str]:
+    """Liest den Metadaten-Kopf (<KEY> value) bis <END OF METADATA>."""
+    metadata = {}
+    with open(tntp_file_path, "r") as f:
+        for line in f:
+            match = _METADATA_PATTERN.match(line.strip())
+            if not match:
+                continue
+            key, value = match.group(1).strip(), match.group(2).strip()
+            if key == "END OF METADATA":
+                break
+            metadata[key] = value
+    return metadata
 
 
 def parse_nodes(node_file_path: str) -> pd.DataFrame:
@@ -47,38 +67,15 @@ def parse_nodes(node_file_path: str) -> pd.DataFrame:
             try:
                 node_data.append({"node_id": int(parts[0]), "x": float(parts[1]), "y": float(parts[2])})
             except ValueError:
-                continue
+                continue  # Kopfzeile ("Node X Y ;")
     return pd.DataFrame(node_data)
-
-
-def parse_zone_nodes(trips_file_path: str) -> set[int]:
-    """Alle Origin-/Destination-Knoten der Trips-Datei gelten als Zonen."""
-    zone_nodes = set()
-    in_origin_block = False
-    with open(trips_file_path, "r") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith(";"):
-                continue
-            if stripped.startswith("Origin"):
-                in_origin_block = True
-                try:
-                    zone_nodes.add(int(stripped.split(" ")[1]))
-                except (ValueError, IndexError):
-                    pass
-            elif in_origin_block:
-                parts = stripped.split(" :")
-                if parts and parts[0].strip().isdigit():
-                    zone_nodes.add(int(parts[0].strip()))
-                else:
-                    in_origin_block = False
-    return zone_nodes
 
 
 def parse_edges(net_file_path: str) -> pd.DataFrame:
     network_data = []
     header_columns: list[str] = []
     found_header = False
+    skipped = 0
 
     with open(net_file_path, "r") as f:
         for line in f:
@@ -88,16 +85,15 @@ def parse_edges(net_file_path: str) -> pd.DataFrame:
 
             if stripped.startswith("~") and "init_node" in stripped and not found_header:
                 header_str = stripped.replace("~", "").strip()
-                raw_parts = [c.strip() for c in header_str.split("\t")]
-                filtered = [p for p in raw_parts if p and p != ";"]
+                filtered = [p for p in header_str.split() if p != ";"]
                 header_columns = [COLUMN_NAME_MAP.get(c.lower(), c) for c in filtered]
                 found_header = True
                 continue
 
             if found_header and stripped:
-                raw_parts = [p.strip() for p in stripped.split("\t")]
-                parts = [p for p in raw_parts if p and p != ";"]
+                parts = [p for p in stripped.split() if p != ";"]
                 if len(parts) != len(header_columns):
+                    skipped += 1
                     continue
                 try:
                     row = {}
@@ -110,20 +106,36 @@ def parse_edges(net_file_path: str) -> pd.DataFrame:
                             row[col] = val
                     network_data.append(row)
                 except ValueError:
-                    continue
+                    skipped += 1
 
     if not network_data:
         raise ValueError(f"Keine Kantendaten in {net_file_path} gefunden.")
+    if skipped:
+        print(f"Warnung: {skipped} Kantenzeilen in {net_file_path} nicht lesbar und übersprungen.")
     return pd.DataFrame(network_data)
 
 
 def load_network(network_dir: str, name: str = "Philadelphia") -> NetworkFrames:
-    """Liest Knoten, Zonen und Kanten eines Netzwerks ein."""
+    """Liest Knoten und Kanten eines Netzwerks ein und prüft die Anzahlen gegen den Dateikopf.
+
+    Zonen: Nach TNTP-Konvention sind die Knoten 1..<NUMBER OF ZONES> die Zonen (Origin/Destination,
+    <FIRST THRU NODE> = Zonenanzahl + 1). Früher wurden Zonen aus der Trips-Datei geparst; das hat
+    Zonen ohne Trips und alle Origins (mehrere Leerzeichen in "Origin       1") übersehen.
+    """
+    net_path = os.path.join(network_dir, f"{name}_net.tntp")
+    metadata = parse_metadata(net_path)
+    num_zones = int(metadata["NUMBER OF ZONES"])
+
     nodes_df = parse_nodes(os.path.join(network_dir, f"{name}_node.tntp"))
-    zone_nodes = parse_zone_nodes(os.path.join(network_dir, f"{name}_trips.tntp"))
-    nodes_df["type"] = nodes_df["node_id"].apply(lambda n: "zone" if n in zone_nodes else "crossing")
+    nodes_df["type"] = (nodes_df["node_id"] <= num_zones).map({True: "zone", False: "crossing"})
 
-    edges_df = parse_edges(os.path.join(network_dir, f"{name}_net.tntp"))
+    edges_df = parse_edges(net_path)
 
-    print(f"{name}: {len(nodes_df)} Knoten ({len(zone_nodes)} Zonen), {len(edges_df)} Kanten")
-    return NetworkFrames(nodes=nodes_df, edges=edges_df)
+    for key, actual in [("NUMBER OF NODES", len(nodes_df)), ("NUMBER OF LINKS", len(edges_df))]:
+        expected = int(metadata.get(key, actual))
+        if expected != actual:
+            raise ValueError(f"{name}: {key} laut Dateikopf {expected}, eingelesen {actual}.")
+
+    n_zones = int((nodes_df["type"] == "zone").sum())
+    print(f"{name}: {len(nodes_df)} Knoten ({n_zones} Zonen), {len(edges_df)} Kanten")
+    return NetworkFrames(nodes=nodes_df, edges=edges_df, metadata=metadata)
